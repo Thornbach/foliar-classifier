@@ -1,0 +1,18 @@
+[package]
+name = "foliar_classifier"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.29"
+image = { version = "0.24", features = ["jpeg", "png", "bmp", "tiff"] }
+rand = "0.8"
+rfd = "0.12"
+
+# Add this section for Release builds
+[profile.release]
+opt-level = 3       # Max optimization
+lto = true          # Link Time Optimization (smaller binary)
+codegen-units = 1   # Slower build, faster binary
+strip = true        # Remove symbols (smaller binary)
+panic = "abort"     # Crash immediately on panic (smaller binary)
