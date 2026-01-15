@@ -24,7 +24,7 @@ A standalone tool for classifying datasets and creating segmentation masks for f
 - **Output:** Saves masks to a `masks` subfolder.
 
 ## How to Run
-1. Go to the [Releases Page]().
+1. Go to the [Releases Page](https://github.com/Thornbach/foliar-classifier/releases/tag/0.1).
 2. Download `foliar_classifier.exe`.
 3. Place the `.exe` in a folder (optional).
 4. Double-click to run. No installation required.
