@@ -1,10 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use eframe::{
     egui::{self, Color32, Key, Layout, PointerButton, Pos2, Rect, RichText, Sense, Stroke, TextureOptions, Vec2},
     epaint::{ColorImage, TextureHandle},
 };
-use image::{DynamicImage, Rgba, RgbaImage};
+use image::{DynamicImage, GenericImage, Rgba, RgbaImage};
 use rand::seq::SliceRandom;
+use regex::Regex;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,6 +17,11 @@ const COLOR_MINING: [u8; 4] = [254, 13, 240, 255];
 const COLOR_SKELETONIZER: [u8; 4] = [106, 61, 154, 255];
 const COLOR_SURFACE: [u8; 4] = [218, 137, 55, 255];
 const COLOR_ERASER: [u8; 4] = [0, 0, 0, 0];
+
+// --- Tiling Configuration ---
+const TILE_WIDTH: u32 = 256;
+const TILE_HEIGHT: u32 = 256;
+const TILE_STRIDE: u32 = 204; 
 
 #[derive(PartialEq)]
 enum AppTab {
@@ -52,42 +59,40 @@ impl BrushType {
     }
 }
 
-// --- Structs for State Management ---
-
 struct ClassificationAction {
     original_source: PathBuf,
     copied_destination: PathBuf,
     label: String,
 }
 
+struct ContextMap {
+    texture: Option<TextureHandle>,
+    base_name: String,
+    active_rect: Option<Rect>, 
+}
+
 struct ClassifierState {
     workspace_path: Option<PathBuf>,
-    
     current_image_path: Option<PathBuf>,
     current_texture: Option<TextureHandle>,
-
+    context_map: ContextMap,
+    filename_regex: Regex,
     last_classified_texture: Option<TextureHandle>,
     last_classified_label: String,
-
     processed_session_files: HashSet<PathBuf>,
     undo_stack: Vec<ClassificationAction>,
     session_count: usize,
-    
     status_msg: String,
 }
 
 struct SegmentationState {
     images_queue: Vec<PathBuf>,
     current_image_path: Option<PathBuf>,
-
     base_texture: Option<TextureHandle>,
     mask_texture: Option<TextureHandle>,
-
     mask_image: Option<RgbaImage>,
-
     brush_type: BrushType,
     brush_size: f32,
-    
     pan: Vec2,
     scale: f32,
 }
@@ -106,6 +111,12 @@ impl Default for MyApp {
                 workspace_path: None,
                 current_image_path: None,
                 current_texture: None,
+                context_map: ContextMap {
+                    texture: None,
+                    base_name: String::new(),
+                    active_rect: None,
+                },
+                filename_regex: Regex::new(r"^(.*)_(\d+)_(\d+)\.[^.]+$").unwrap(),
                 last_classified_texture: None,
                 last_classified_label: String::new(),
                 processed_session_files: HashSet::new(),
@@ -131,7 +142,7 @@ impl Default for MyApp {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
+            .with_inner_size([1280.0, 900.0])
             .with_title("Image Classifier & Segmenter"),
         ..Default::default()
     };
@@ -143,7 +154,17 @@ fn main() -> eframe::Result<()> {
 }
 
 impl MyApp {
-    // --- Shared Helpers ---
+    fn parse_tile_info(&self, path: &Path) -> Option<(String, u32, u32)> {
+        let filename = path.file_name()?.to_string_lossy();
+        if let Some(caps) = self.classifier.filename_regex.captures(&filename) {
+            let base = caps.get(1)?.as_str().to_string();
+            let idx_x = caps.get(2)?.as_str().parse::<u32>().ok()?;
+            let idx_y = caps.get(3)?.as_str().parse::<u32>().ok()?;
+            return Some((base, idx_x, idx_y));
+        }
+        None
+    }
+
     fn load_image_to_texture(
         ctx: &egui::Context,
         path: &Path,
@@ -163,7 +184,88 @@ impl MyApp {
         ))
     }
 
-    // --- Tab 1 Logic ---
+    fn rebuild_context_map(&mut self, ctx: &egui::Context, current_tile_path: &Path) {
+        let ws = match &self.classifier.workspace_path {
+            Some(p) => p,
+            None => return,
+        };
+
+        let (base_name, cur_idx_x, cur_idx_y) = match self.parse_tile_info(current_tile_path) {
+            Some(info) => info,
+            None => {
+                self.classifier.context_map.texture = None;
+                return;
+            }
+        };
+
+        if self.classifier.context_map.base_name == base_name && self.classifier.context_map.texture.is_some() {
+            let pixel_x = (cur_idx_x.saturating_sub(1) * TILE_STRIDE) as f32;
+            let pixel_y = (cur_idx_y.saturating_sub(1) * TILE_STRIDE) as f32;
+            
+            self.classifier.context_map.active_rect = Some(Rect::from_min_size(
+                Pos2::new(pixel_x, pixel_y),
+                Vec2::new(TILE_WIDTH as f32, TILE_HEIGHT as f32)
+            ));
+            return;
+        }
+
+        let mut siblings: Vec<(PathBuf, u32, u32)> = Vec::new();
+        if let Ok(entries) = fs::read_dir(ws) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() || !is_image(&path) { continue; }
+                
+                if let Some((b, x, y)) = self.parse_tile_info(&path) {
+                    if b == base_name {
+                        siblings.push((path, x, y));
+                    }
+                }
+            }
+        }
+
+        if siblings.is_empty() { return; }
+
+        let max_idx_x = siblings.iter().map(|(_, x, _)| *x).max().unwrap_or(1);
+        let max_idx_y = siblings.iter().map(|(_, _, y)| *y).max().unwrap_or(1);
+
+        let canvas_w = (max_idx_x - 1) * TILE_STRIDE + TILE_WIDTH;
+        let canvas_h = (max_idx_y - 1) * TILE_STRIDE + TILE_HEIGHT;
+
+        if canvas_w > 16384 || canvas_h > 16384 {
+            self.classifier.status_msg = "Context map too large to generate.".to_string();
+            self.classifier.context_map.texture = None;
+            return;
+        }
+
+        let mut canvas = RgbaImage::new(canvas_w, canvas_h);
+        siblings.sort_by_key(|k| (k.2, k.1));
+
+        for (path, idx_x, idx_y) in siblings {
+            if let Ok(img) = image::open(&path) {
+                let rgba = img.to_rgba8();
+                let target_x = (idx_x - 1) * TILE_STRIDE;
+                let target_y = (idx_y - 1) * TILE_STRIDE;
+                image::imageops::overlay(&mut canvas, &rgba, target_x as i64, target_y as i64);
+            }
+        }
+
+        let size = [canvas_w as _, canvas_h as _];
+        let pixels = canvas.as_flat_samples();
+        let color_image = ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
+        let tex = ctx.load_texture(format!("ctx_{}", base_name), color_image, TextureOptions::LINEAR);
+
+        let pixel_x = (cur_idx_x.saturating_sub(1) * TILE_STRIDE) as f32;
+        let pixel_y = (cur_idx_y.saturating_sub(1) * TILE_STRIDE) as f32;
+
+        self.classifier.context_map = ContextMap {
+            texture: Some(tex),
+            base_name,
+            active_rect: Some(Rect::from_min_size(
+                Pos2::new(pixel_x, pixel_y),
+                Vec2::new(TILE_WIDTH as f32, TILE_HEIGHT as f32)
+            )),
+        };
+    }
 
     fn load_random_classifier_image(&mut self, ctx: &egui::Context) {
         if let Some(ws) = &self.classifier.workspace_path {
@@ -189,12 +291,14 @@ impl MyApp {
                         self.classifier.current_image_path = Some((*random_file).clone());
                         self.classifier.status_msg =
                             format!("Loaded: {:?}", random_file.file_name().unwrap());
+                        self.rebuild_context_map(ctx, random_file);
                     }
                     Err(e) => self.classifier.status_msg = format!("Error loading image: {}", e),
                 }
             } else {
                 self.classifier.current_texture = None;
                 self.classifier.current_image_path = None;
+                self.classifier.context_map.texture = None;
                 self.classifier.status_msg = if all_files.is_empty() {
                     "No images found in folder.".to_string()
                 } else {
@@ -217,7 +321,6 @@ impl MyApp {
             let file_name = src.file_name().unwrap();
             let dest_path = dest_folder.join(file_name);
 
-            // COPY logic
             match fs::copy(src, &dest_path) {
                 Ok(_) => {
                     self.classifier.processed_session_files.insert(src.clone());
@@ -257,8 +360,9 @@ impl MyApp {
             match Self::load_image_to_texture(ctx, &action.original_source) {
                 Ok((tex, _)) => {
                     self.classifier.current_texture = Some(tex);
-                    self.classifier.current_image_path = Some(action.original_source);
+                    self.classifier.current_image_path = Some(action.original_source.clone());
                     self.classifier.status_msg = format!("Undid: {}", action.label);
+                    self.rebuild_context_map(ctx, &action.original_source);
                 }
                 Err(_) => self.classifier.status_msg = "Error reloading undid image".to_string(),
             }
@@ -279,8 +383,6 @@ impl MyApp {
             }
         }
     }
-
-    // --- Tab 2 Logic ---
 
     fn init_segmentation_queue(&mut self) {
         if let Some(ws) = &self.classifier.workspace_path {
@@ -364,7 +466,6 @@ impl MyApp {
                     *pixel = Rgba([0, 0, 0, 255]);
                 }
             }
-
             let _ = final_save_img.save(save_path);
         }
     }
@@ -380,40 +481,44 @@ fn is_image(path: &Path) -> bool {
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // --- Shortcuts ---
-        if self.current_tab == AppTab::Segmentation {
+        // --- GLOBAL SHORTCUTS ---
+
+        if self.current_tab == AppTab::Classifier {
+             // Classifier Shortcuts: 1, 2, 3
+             if ctx.input(|i| i.key_pressed(Key::Num1)) {
+                 self.classify_current(ctx, "Healthy");
+             }
+             if ctx.input(|i| i.key_pressed(Key::Num2)) {
+                 self.classify_current(ctx, "Undecided");
+             }
+             if ctx.input(|i| i.key_pressed(Key::Num3)) {
+                 self.classify_current(ctx, "Damaged");
+             }
+        } else if self.current_tab == AppTab::Segmentation {
+            // Segmentation Shortcuts
             if ctx.input(|i| i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals)) {
                 self.segmenter.brush_size += 2.0;
             }
             if ctx.input(|i| i.key_pressed(Key::Minus)) {
                 self.segmenter.brush_size = (self.segmenter.brush_size - 2.0).max(1.0);
             }
+            if ctx.input(|i| i.key_pressed(Key::E)) { self.segmenter.brush_type = BrushType::Eraser; }
+            if ctx.input(|i| i.key_pressed(Key::H)) { self.segmenter.brush_type = BrushType::Hole; }
+            if ctx.input(|i| i.key_pressed(Key::M)) { self.segmenter.brush_type = BrushType::Mining; }
+            if ctx.input(|i| i.key_pressed(Key::S)) { self.segmenter.brush_type = BrushType::Skeletonizer; }
+            if ctx.input(|i| i.key_pressed(Key::O) || i.key_pressed(Key::U)) { self.segmenter.brush_type = BrushType::Surface; }
         }
 
-        // --- Top Menu (Always on top) ---
+        // --- TOP MENU ---
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(
-                    &mut self.current_tab,
-                    AppTab::Classifier,
-                    " 1. Classifier ",
-                );
-                if ui
-                    .selectable_value(
-                        &mut self.current_tab,
-                        AppTab::Segmentation,
-                        " 2. Segmentation ",
-                    )
-                    .clicked()
-                {
-                    if self.segmenter.images_queue.is_empty()
-                        && self.segmenter.base_texture.is_none()
-                    {
+                ui.selectable_value(&mut self.current_tab, AppTab::Classifier, " 1. Classifier ");
+                if ui.selectable_value(&mut self.current_tab, AppTab::Segmentation, " 2. Segmentation ").clicked() {
+                    if self.segmenter.images_queue.is_empty() && self.segmenter.base_texture.is_none() {
                         self.init_segmentation_queue();
                         self.load_next_segmentation(ctx);
                     }
                 }
-                
                 ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.current_tab == AppTab::Classifier {
                         ui.label(RichText::new(format!("Session Classified: {}", self.classifier.session_count)).strong());
@@ -433,19 +538,18 @@ impl eframe::App for MyApp {
 
 impl MyApp {
     fn ui_classifier(&mut self, ctx: &egui::Context) {
-        // --- 1. Bottom Button Panel (Anchored Bottom) ---
-        // FIX: Use exact_height to prevent layout collapse
         egui::TopBottomPanel::bottom("class_bottom_panel")
             .resizable(false)
-            .exact_height(100.0) // Force height to 100px
+            .exact_height(100.0)
             .show(ctx, |ui| {
-                // Use a centered horizontal layout inside the fixed height panel
                 ui.with_layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
                      ui.horizontal(|ui| {
                         let btn_h = 50.0;
                         let btn_w = 140.0;
-                        
                         let has_image = self.classifier.current_texture.is_some();
+                        
+                        ui.label(RichText::new("Shortcuts: [1] Healthy, [2] Undecided, [3] Damaged").weak());
+                        ui.add_space(20.0);
 
                         let big_btn = |ui: &mut egui::Ui, text: &str, color: Color32| {
                             ui.add_enabled(
@@ -456,15 +560,15 @@ impl MyApp {
                             )
                         };
 
-                        if big_btn(ui, "Healthy", Color32::from_rgb(46, 125, 50)).clicked() {
+                        if big_btn(ui, "Healthy (1)", Color32::from_rgb(46, 125, 50)).clicked() {
                             self.classify_current(ctx, "Healthy");
                         }
                         ui.add_space(15.0);
-                        if big_btn(ui, "Undecided", Color32::from_rgb(117, 117, 117)).clicked() {
+                        if big_btn(ui, "Undecided (2)", Color32::from_rgb(117, 117, 117)).clicked() {
                             self.classify_current(ctx, "Undecided");
                         }
                         ui.add_space(15.0);
-                        if big_btn(ui, "Damaged", Color32::from_rgb(198, 40, 40)).clicked() {
+                        if big_btn(ui, "Damaged (3)", Color32::from_rgb(198, 40, 40)).clicked() {
                             self.classify_current(ctx, "Damaged");
                         }
 
@@ -473,17 +577,13 @@ impl MyApp {
                         ui.add_space(40.0);
 
                         let undo_enabled = !self.classifier.undo_stack.is_empty();
-                        let undo_btn = egui::Button::new(RichText::new("Undo").size(18.0))
-                            .min_size(Vec2::new(btn_w, btn_h));
-                        
-                        if ui.add_enabled(undo_enabled, undo_btn).clicked() {
+                        if ui.add_enabled(undo_enabled, egui::Button::new(RichText::new("Undo").size(18.0)).min_size(Vec2::new(btn_w, btn_h))).clicked() {
                             self.undo_last_classification(ctx);
                         }
                     });
                 });
             });
 
-        // --- 2. Left Sidebar (With ScrollArea) ---
         egui::SidePanel::left("class_left_panel")
             .resizable(true)
             .default_width(250.0)
@@ -498,10 +598,10 @@ impl MyApp {
                             self.classifier.processed_session_files.clear();
                             self.classifier.session_count = 0;
                             self.classifier.last_classified_texture = None;
+                            self.classifier.context_map.texture = None;
                             self.load_random_classifier_image(ctx);
                         }
                     }
-                    
                     ui.label(RichText::new(&self.classifier.status_msg).size(12.0).italics());
 
                     ui.separator();
@@ -517,8 +617,41 @@ impl MyApp {
                 });
             });
 
-        // --- 3. Central Panel (Fills remaining space) ---
         egui::CentralPanel::default().show(ctx, |ui| {
+            // Context Map
+            if let Some(ctx_tex) = &self.classifier.context_map.texture {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(format!("Context Map: {}", self.classifier.context_map.base_name)).strong());
+                    
+                    let avail = ui.available_size();
+                    let max_h = avail.y * 0.45; 
+                    
+                    let img_resp = ui.add(egui::Image::new(ctx_tex).max_height(max_h).maintain_aspect_ratio(true));
+                    
+                    if let Some(active_rect_px) = self.classifier.context_map.active_rect {
+                         let tex_w = ctx_tex.size()[0] as f32;
+                         let tex_h = ctx_tex.size()[1] as f32;
+                         
+                         let rect = img_resp.rect; 
+                         let ratio_x = rect.width() / tex_w;
+                         let ratio_y = rect.height() / tex_h;
+                         
+                         let screen_x = rect.min.x + active_rect_px.min.x * ratio_x;
+                         let screen_y = rect.min.y + active_rect_px.min.y * ratio_y;
+                         let screen_w = active_rect_px.width() * ratio_x;
+                         let screen_h = active_rect_px.height() * ratio_y;
+                         
+                         ui.painter().rect_stroke(
+                            Rect::from_min_size(Pos2::new(screen_x, screen_y), Vec2::new(screen_w, screen_h)), 
+                            0.0, 
+                            Stroke::new(3.0, Color32::RED)
+                        );
+                    }
+                });
+                ui.separator();
+            }
+
+            // Current Tile
             if let Some(tex) = &self.classifier.current_texture {
                 let avail_size = ui.available_size();
                 ui.centered_and_justified(|ui| {
@@ -537,14 +670,12 @@ impl MyApp {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Tools");
                 ui.separator();
+                ui.small("Shortcuts: E=Eraser, H=Hole, M=Mining, S=Skeleton, O=Surface. +/- Brush Size.");
+                ui.add_space(5.0);
 
                 let mut brush_btn = |b_type: BrushType, label: &str| {
                     let is_selected = self.segmenter.brush_type == b_type;
-                    let color = if b_type == BrushType::Eraser {
-                        Color32::WHITE
-                    } else {
-                        b_type.color32()
-                    };
+                    let color = if b_type == BrushType::Eraser { Color32::WHITE } else { b_type.color32() };
                     let text = RichText::new(label).color(color).strong();
                     if ui.selectable_label(is_selected, text).clicked() {
                         self.segmenter.brush_type = b_type;
@@ -587,24 +718,16 @@ impl MyApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let (Some(base_tex), Some(mask_tex)) = (
-                &self.segmenter.base_texture,
-                &self.segmenter.mask_texture,
-            ) {
-                let (rect, response) =
-                    ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+            if let (Some(base_tex), Some(mask_tex)) = (&self.segmenter.base_texture, &self.segmenter.mask_texture) {
+                let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
 
-                // Zoom control
                 let scroll = ctx.input(|i| i.raw_scroll_delta);
                 if scroll.y != 0.0 {
                     let zoom_factor = if scroll.y > 0.0 { 1.1 } else { 0.9 };
                     self.segmenter.scale *= zoom_factor;
                 }
 
-                // Pan control (Middle Mouse or Shift+Drag)
-                if response.dragged_by(PointerButton::Middle)
-                    || (response.dragged() && ctx.input(|i| i.modifiers.shift))
-                {
+                if response.dragged_by(PointerButton::Middle) || (response.dragged() && ctx.input(|i| i.modifiers.shift)) {
                     self.segmenter.pan += response.drag_delta();
                 }
 
@@ -614,35 +737,23 @@ impl MyApp {
                 let image_rect = Rect::from_center_size(center, [img_w, img_h].into());
 
                 let painter = ui.painter().with_clip_rect(rect);
+                painter.image(base_tex.id(), image_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                painter.image(mask_tex.id(), image_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
 
-                // Layers
-                painter.image(
-                    base_tex.id(),
-                    image_rect,
-                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-                painter.image(
-                    mask_tex.id(),
-                    image_rect,
-                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-
-                // Brush Outline
                 if let Some(mouse_pos) = response.hover_pos() {
                     if rect.contains(mouse_pos) {
-                         painter.circle_stroke(
-                            mouse_pos,
-                            self.segmenter.brush_size / 2.0,
-                            Stroke::new(1.0, Color32::WHITE),
-                        );
+                         painter.circle_stroke(mouse_pos, self.segmenter.brush_size / 2.0, Stroke::new(1.0, Color32::WHITE));
                     }
                 }
 
-                // Drawing
-                if response.dragged_by(PointerButton::Primary) && !ctx.input(|i| i.modifiers.shift) {
-                    if let Some(pointer_pos) = response.interact_pointer_pos() {
+                let active_draw = (response.dragged_by(PointerButton::Primary) 
+                    || (response.hovered() && ctx.input(|i| i.pointer.primary_down())))
+                    && !ctx.input(|i| i.modifiers.shift);
+
+                if active_draw {
+                    let pointer_pos = response.interact_pointer_pos().or(response.hover_pos());
+
+                    if let Some(pointer_pos) = pointer_pos {
                         let rel_x = (pointer_pos.x - image_rect.min.x) / image_rect.width();
                         let rel_y = (pointer_pos.y - image_rect.min.y) / image_rect.height();
 
@@ -652,11 +763,9 @@ impl MyApp {
                                 let h = mask.height() as f32;
                                 let cx = rel_x * w;
                                 let cy = rel_y * h;
-
                                 let r = (self.segmenter.brush_size / image_rect.width()) * w / 2.0;
                                 let color = self.segmenter.brush_type.to_rgba();
                                 let r_sq = r * r;
-
                                 let min_x = (cx - r).max(0.0) as u32;
                                 let max_x = (cx + r).min(w - 1.0) as u32;
                                 let min_y = (cy - r).max(0.0) as u32;

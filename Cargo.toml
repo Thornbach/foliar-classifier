@@ -1,6 +1,6 @@
 [package]
 name = "foliar_classifier"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -8,6 +8,7 @@ eframe = "0.29"
 image = { version = "0.24", features = ["jpeg", "png", "bmp", "tiff"] }
 rand = "0.8"
 rfd = "0.12"
+regex = "1.10" 
 
 # Add this section for Release builds
 [profile.release]
